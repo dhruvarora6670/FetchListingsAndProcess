@@ -3,37 +3,67 @@ import cv2
 from io import BytesIO
 from PIL import Image
 import csv
+import json
 from google.cloud import storage
 import boto3
-import json
-from tqdm import tqdm
-def load_bucket_credentials(credential_file):
-    with open(credential_file) as f:
-        credentials = json.load(f)
-    return credentials
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
 
-def draw_grid_cloud_bucket(bucket_name, input_folder, output_folder, csv_file_path, credentials_file):
-    # Explicitly pass the credentials file path to the storage client
-    client = storage.Client.from_service_account_json(credentials_file)
+app = FastAPI()
+
+@app.get("/")
+def read_root():
+    return {"message": "FastAPI endpoint is running"}
+
+@app.post("/load_bucket_credentials/")
+async def load_bucket_credentials(credential_file: UploadFile):
+    credentials = json.load(await credential_file.read())
+    return JSONResponse(content=credentials)
+
+@app.post("/draw_grid/")
+async def draw_grid(bucket_name: str, input_folder: str, output_folder: str, credentials_file: UploadFile):
+    # Store the credentials file temporarily
+    credential_path = os.path.join("/tmp", credentials_file.filename)
+    with open(credential_path, "wb") as f:
+        f.write(await credentials_file.read())
+
+    # Initialize Google Cloud Storage client
+    client = storage.Client.from_service_account_json(credential_path)
     bucket = client.bucket(bucket_name)
 
+    # Iterate through blobs and process the images
     blobs = bucket.list_blobs(prefix=input_folder)
 
-    for blob in tqdm(blobs):
-        if blob.name.endswith(('.jpg', '.jpeg', '.png')) and 'amazon' in blob.name.lower():
-            local_path = os.path.join(output_folder, os.path.basename(blob.name))
-            blob.download_to_filename(local_path)
-            image = cv2.imread(local_path)
-            red_boxes = detect_grid(image)
-            processed_image_path = os.path.join(output_folder, f"processed_{os.path.basename(blob.name)}")
-            cv2.imwrite(processed_image_path, image)
-            os.remove(local_path)
-            
-            # Get the bucket link for the current image
-            bucket_link = f"https://storage.googleapis.com/{bucket_name}/{blob.name}"
-            
-            # Pass the bucket link to detect_text function
-            detect_text(processed_image_path, csv_file_path, bucket_link)
+    # Store results
+    csv_file_path = os.path.join("/tmp", "Version_1.csv")
+    with open(csv_file_path, 'w', newline='', encoding='utf-8') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Image Name', 'Order', 'Box Coordinates', 'Detected Text', 'Bucket Link'])
+
+        for blob in blobs:
+            if blob.name.endswith(('.jpg', '.jpeg', '.png')) and 'amazon' in blob.name.lower():
+                local_path = os.path.join(output_folder, os.path.basename(blob.name))
+                blob.download_to_filename(local_path)
+
+                # Process the image
+                image = cv2.imread(local_path)
+                red_boxes = detect_grid(image)
+
+                # Save the processed image
+                processed_image_path = os.path.join(output_folder, f"processed_{os.path.basename(blob.name)}")
+                cv2.imwrite(processed_image_path, image)
+
+                # Remove the local file after processing
+                os.remove(local_path)
+
+                # Get the bucket link for the current image
+                bucket_link = f"https://storage.googleapis.com/{bucket_name}/{blob.name}"
+
+                # Detect text and update CSV
+                detect_text(processed_image_path, csv_file_path, bucket_link)
+
+    return {"message": "Processed images and generated CSV", "csv_path": csv_file_path}
+
 
 def detect_grid(image):
     # Convert to grayscale
@@ -49,8 +79,8 @@ def detect_grid(image):
     height, width = image.shape[:2]
 
     # Define header and footer regions to exclude
-    header_height = int(0.02 * height)  # Assuming header occupies 10% of the image height
-    footer_height = int(0.1 * height)  # Assuming footer occupies 10% of the image height
+    header_height = int(0.02 * height)
+    footer_height = int(0.1 * height)
 
     red_boxes = []
 
@@ -60,7 +90,7 @@ def detect_grid(image):
         area = cv2.contourArea(c)
 
         # Filter out contours based on area
-        if area < 180:  # Adjust the minimum area threshold as needed
+        if area < 180:
             continue
 
         # Get bounding box coordinates
@@ -77,6 +107,7 @@ def detect_grid(image):
         red_boxes.append((x, y, w, h))
 
     return red_boxes
+
 
 def detect_text(image_path, csv_file_path, bucket_link):
     rekognition_client = boto3.client('rekognition')
@@ -114,27 +145,3 @@ def detect_text(image_path, csv_file_path, bucket_link):
                 all_text += text_detection['DetectedText'].strip() + " "
 
             writer.writerow([os.path.basename(image_path), idx, (x, y, w, h), all_text.strip(), bucket_link])
-
-    print(f"Detected text from {image_path} saved to {csv_file_path}")
-
-# Load bucket credentials
-bucket_credentials_file = r"/Users/dhruvarora/Documents/Smollan : Google/onyx-oxygen-375915-b66e5ff41e06.json"
-bucket_credentials = load_bucket_credentials(bucket_credentials_file)
-bucket_credentials = {
-    "bucket_name": "harmony_paas",
-    "input_folder": "PaaS Data/digital_capture/27-04-24/Page Listings",
-    "output_folder": r"/Users/dhruvarora/Documents/Smollan : Google/Listings Data Extraction"
-}
-csv_file_path = 'Version_1.csv'
-
-with open(csv_file_path, 'w', newline='', encoding='utf-8') as file:
-    writer = csv.writer(file)
-    writer.writerow(['Image Name', 'Order', 'Box Coordinates', 'Detected Text', 'Bucket Link'])
-
-draw_grid_cloud_bucket(
-    bucket_credentials["bucket_name"],
-    bucket_credentials["input_folder"],
-    bucket_credentials["output_folder"],
-    csv_file_path,
-    r"/Users/dhruvarora/Documents/Smollan : Google/onyx-oxygen-375915-b66e5ff41e06.json"
-)
